@@ -1,12 +1,21 @@
 package main
 
 import (
+	"bufio"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/tailscale/libtailscale/tsnetctest"
 	"golang.org/x/sys/unix"
+	"tailscale.com/tsnet"
+	"tailscale.com/types/logger"
 )
 
 func TestConn(t *testing.T) {
@@ -167,5 +176,90 @@ func TestExtractIP(t *testing.T) {
 
 	if got6 != want6 {
 		t.Errorf("ipv6 port stripping failed %s != %s", got6, want6)
+	}
+}
+
+// TestAcceptUnderLoad holds that every connection a listener accepts arrives
+// open, with many connections coming in at once: 8 peers dial 20 connections
+// each while the program takes each connection and says its line back.
+//
+// acceptLoop hands each accepted connection to the program as a descriptor in a
+// record on the listener's socket pair, and until receive reads that record the
+// message is the socket's only reference. On a Mac the collector of in-flight
+// descriptors then takes such a socket and shuts it, and the program receives a
+// connection that reads as closed before the peer's first byte: before the fix,
+// 7 to 25 of these 160 connections arrived closed, run after run. Linux's
+// collector does not take such a socket. One peer dialing at a time does not
+// bring it out, so the connections have to come in at once.
+//
+// This drives the listener's own handoff, with a socket pair standing in for
+// the end C holds; TestConn and TestGetRemoteAddr cover the same code end to
+// end through the C API.
+func TestAcceptUnderLoad(t *testing.T) {
+	const dialers, each = 8, 20
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	// The listener's socket pair: fds[0] is the program's end, and fds[1] is
+	// the end acceptLoop sends on.
+	fds, err := socketpair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Close(fds[0])
+	defer syscall.Close(fds[1])
+
+	l := &listener{s: &server{s: &tsnet.Server{Logf: logger.Discard}}, ln: ln, fd: fds[1]}
+	go l.acceptLoop(func() {})
+
+	// The program's side: take each connection and say its line back.
+	go func() {
+		for {
+			fd, _, err := l.receive(fds[0])
+			if err != nil {
+				return
+			}
+			go func() {
+				f := os.NewFile(uintptr(fd), "connection")
+				defer f.Close()
+				line, err := bufio.NewReader(f).ReadString('\n')
+				if err != nil {
+					return
+				}
+				io.WriteString(f, line)
+			}()
+		}
+	}()
+
+	var lost atomic.Int64
+	var dialing sync.WaitGroup
+	for d := 0; d < dialers; d++ {
+		dialing.Add(1)
+		go func() {
+			defer dialing.Done()
+			for i := 0; i < each; i++ {
+				said := fmt.Sprintf("connection %d.%d\n", d, i)
+				conn, err := net.Dial("tcp", ln.Addr().String())
+				if err != nil {
+					lost.Add(1)
+					continue
+				}
+				conn.SetDeadline(time.Now().Add(10 * time.Second))
+				io.WriteString(conn, said)
+				heard, err := bufio.NewReader(conn).ReadString('\n')
+				conn.Close()
+				if err != nil || heard != said {
+					lost.Add(1)
+				}
+			}
+		}()
+	}
+	dialing.Wait()
+	if n := lost.Load(); n != 0 {
+		t.Fatalf("%d of %d connections arrived closed: each of them was shut while its descriptor was in flight", n, dialers*each)
 	}
 }

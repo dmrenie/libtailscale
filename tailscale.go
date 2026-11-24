@@ -65,6 +65,42 @@ type listener struct {
 	// m maps the fd number C holds for an accepted connection (not our
 	// sender-side number; recvmsg installs a new one) to its remote IP.
 	m map[C.int]string
+	// inFlight holds our own copy of the descriptor of each connection that has
+	// been sent to C and not yet received, in the order sent. macOS's collector
+	// of in-flight descriptors can take a socket whose only reference is a
+	// message on its way, and shut it, so C would receive a connection that is
+	// already closed. The copy stays open until receive has read the record.
+	inFlight []int
+	// recvMu makes reading a record and closing the head of inFlight one step,
+	// so that the head is always the record that the caller read, even when C
+	// calls tailscale_accept from more than one thread.
+	recvMu sync.Mutex
+}
+
+// takeCopy closes our copy of the head of the queue, which is the connection
+// that C has just received, and gives it up.
+func (l *listener) takeCopy() {
+	l.mu.Lock()
+	if len(l.inFlight) > 0 {
+		syscall.Close(l.inFlight[0])
+		l.inFlight = l.inFlight[1:]
+	}
+	l.mu.Unlock()
+}
+
+// dropCopy gives up our copy of fd, which is the head of the queue, and closes
+// it, unless the listener's teardown has closed it already.
+func (l *listener) dropCopy(fd int) {
+	l.mu.Lock()
+	held := false
+	if n := len(l.inFlight); n > 0 && l.inFlight[n-1] == fd {
+		l.inFlight = l.inFlight[:n-1]
+		held = true
+	}
+	l.mu.Unlock()
+	if held {
+		syscall.Close(fd)
+	}
 }
 
 // listenAddrLen is the size of the fixed-size, NUL-padded record that
@@ -268,6 +304,14 @@ func TsnetListen(sd C.int, network, addr *C.char, listenerOut *C.int) C.int {
 		}
 		listeners.mu.Unlock()
 
+		// The connections that C never received.
+		listener.mu.Lock()
+		for _, fd := range listener.inFlight {
+			syscall.Close(fd)
+		}
+		listener.inFlight = nil
+		listener.mu.Unlock()
+
 		ln.Close()
 	}
 	go func() {
@@ -280,50 +324,61 @@ func TsnetListen(sd C.int, network, addr *C.char, listenerOut *C.int) C.int {
 		syscall.Read(sp, buf[:])
 		cleanup()
 	}()
-	go func() {
-		defer cleanup()
-		for {
-			netConn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			var connFd C.int
-			if err := newConn(s, netConn, &connFd); err != nil {
-				if s.s.Logf != nil {
-					s.s.Logf("libtailscale.accept: newConn: %v", err)
-				}
-				netConn.Close()
-				continue
-			}
-			ip := extractIP(netConn.RemoteAddr().String())
-			if len(ip) >= listenAddrLen {
-				if s.s.Logf != nil {
-					s.s.Logf("libtailscale.accept: remote address %q does not fit in a %d-byte record", ip, listenAddrLen)
-				}
-				netConn.Close()
-				syscall.Close(int(connFd))
-				continue
-			}
-			var addrRec [listenAddrLen]byte
-			copy(addrRec[:], ip)
-
-			rights := syscall.UnixRights(int(connFd))
-			err = syscall.Sendmsg(sp, addrRec[:], rights, nil, 0)
-			if err != nil {
-				// a failed sendmsg delivered nothing (sp being closed is
-				// handled by the read goroutine above)
-				if s.s.Logf != nil {
-					s.s.Logf("libtailscale.accept: sendmsg failed: %v", err)
-				}
-				netConn.Close()
-			}
-
-			syscall.Close(int(connFd)) // now owned by recvmsg
-		}
-	}()
+	go listener.acceptLoop(cleanup)
 
 	*listenerOut = fdC
 	return 0
+}
+
+// acceptLoop takes connections from the listener and hands each one to the
+// program as a descriptor in a record on the listener's socket pair. It returns
+// when the listener stops accepting, and calls cleanup when it does, either on
+// that or on the program closing its end of the pair.
+func (l *listener) acceptLoop(cleanup func()) {
+	defer cleanup()
+	for {
+		netConn, err := l.ln.Accept()
+		if err != nil {
+			return
+		}
+		var connFd C.int
+		if err := newConn(l.s, netConn, &connFd); err != nil {
+			if l.s.s.Logf != nil {
+				l.s.s.Logf("libtailscale.accept: newConn: %v", err)
+			}
+			netConn.Close()
+			continue
+		}
+		ip := extractIP(netConn.RemoteAddr().String())
+		if len(ip) >= listenAddrLen {
+			if l.s.s.Logf != nil {
+				l.s.s.Logf("libtailscale.accept: remote address %q does not fit in a %d-byte record", ip, listenAddrLen)
+			}
+			netConn.Close()
+			syscall.Close(int(connFd))
+			continue
+		}
+		var addrRec [listenAddrLen]byte
+		copy(addrRec[:], ip)
+
+		l.mu.Lock()
+		l.inFlight = append(l.inFlight, int(connFd))
+		l.mu.Unlock()
+
+		rights := syscall.UnixRights(int(connFd))
+		err = syscall.Sendmsg(l.fd, addrRec[:], rights, nil, 0)
+		if err != nil {
+			// a failed sendmsg delivered nothing (sp being closed is
+			// handled by the read goroutine above)
+			if l.s.s.Logf != nil {
+				l.s.s.Logf("libtailscale.accept: sendmsg failed: %v", err)
+			}
+			netConn.Close()
+			// A failed sendmsg delivered nothing, so the copy is still ours.
+			l.dropCopy(int(connFd))
+		}
+		// On success, receive closes our copy once C holds its own.
+	}
 }
 
 //export TsnetAccept
@@ -336,16 +391,35 @@ func TsnetAccept(listenerFd C.int, connOut *C.int) C.int {
 		return C.EBADF
 	}
 
-	// One record per connection: the fd via SCM_RIGHTS plus its remote
-	// IP. The fd parsed below is the number the kernel installed, i.e.
-	// the number C will hold, and it is close-on-exec (via recvFlags on
-	// Linux, or the closeOnExec call below elsewhere).
-	//
-	// The socketpair is a stream socket, so records are framed here:
-	// each read asks for the remaining bytes of the head record, with
-	// MSG_WAITALL. The FIFO never serves a later record's bytes first,
-	// so each accept consumes exactly one record, even concurrently or
-	// after EINTR.
+	fd, addr, err := ln.receive(int(listenerFd))
+	if err != nil {
+		return ln.s.recErr(err)
+	}
+
+	// the entry must exist before C can learn this fd number
+	ln.mu.Lock()
+	ln.m[fd] = addr
+	ln.mu.Unlock()
+
+	*connOut = fd
+
+	return 0
+}
+
+// receive reads one record from the listener's socket pair, listenerFd, and
+// returns the descriptor that the kernel installed for it, which C then holds,
+// and the remote address that came in the record.
+//
+// One record per connection: the fd via SCM_RIGHTS plus its remote IP. The fd
+// returned is the number the kernel installed, i.e. the number C will hold, and
+// it is close-on-exec (via recvFlags on Linux, or the closeOnExec call below
+// elsewhere).
+//
+// The socketpair is a stream socket, so records are framed here: each read asks
+// for the remaining bytes of the head record, with MSG_WAITALL. The FIFO never
+// serves a later record's bytes first, so each accept consumes exactly one
+// record, even concurrently or after EINTR.
+func (l *listener) receive(listenerFd int) (C.int, string, error) {
 	data := make([]byte, listenAddrLen)
 	cbuf := make([]byte, unix.CmsgLen(int(unsafe.Sizeof((C.int)(0)))))
 	var n, oobn int
@@ -355,7 +429,7 @@ func TsnetAccept(listenerFd C.int, connOut *C.int) C.int {
 			// the cmsg rode with the record's first byte; only the tail remains
 			cbuf = nil
 		}
-		nn, on, _, _, err := syscall.Recvmsg(int(listenerFd), buf, cbuf, recvFlags)
+		nn, on, _, _, err := syscall.Recvmsg(listenerFd, buf, cbuf, recvFlags)
 		n += nn
 		if nn > 0 {
 			oobn = on
@@ -364,43 +438,40 @@ func TsnetAccept(listenerFd C.int, connOut *C.int) C.int {
 			continue // partial bytes stay record-aligned, keep draining
 		}
 		if err != nil {
-			return ln.s.recErr(err)
+			return 0, "", err
 		}
 		if nn == 0 {
 			// EOF mid-record: the listener was closed on the C side.
-			return ln.s.recErr(fmt.Errorf("libtailscale: listener closed mid-record: got %d of %d bytes", n, len(data)))
+			return 0, "", fmt.Errorf("libtailscale: listener closed mid-record: got %d of %d bytes", n, len(data))
 		}
 	}
 
+	// The record is here, and with it C's own copy of the descriptor: our
+	// copy of the head of the connections in flight can close now.
+	l.takeCopy()
+
 	scms, err := syscall.ParseSocketControlMessage(cbuf[:oobn])
 	if err != nil {
-		return ln.s.recErr(err)
+		return 0, "", err
 	}
 	if len(scms) != 1 {
-		return ln.s.recErr(fmt.Errorf("libtailscale: got %d control messages, want 1", len(scms)))
+		return 0, "", fmt.Errorf("libtailscale: got %d control messages, want 1", len(scms))
 	}
 	fds, err := syscall.ParseUnixRights(&scms[0])
 	if err != nil {
-		return ln.s.recErr(err)
+		return 0, "", err
 	}
 	if len(fds) != 1 {
-		return ln.s.recErr(fmt.Errorf("libtailscale: got %d FDs, want 1", len(fds)))
+		return 0, "", fmt.Errorf("libtailscale: got %d FDs, want 1", len(fds))
 	}
 	fd := C.int(fds[0])
 	closeOnExec(int(fd))
 
-	// the entry must exist before C can learn this fd number
 	addrLen := bytes.IndexByte(data, 0)
 	if addrLen < 0 {
 		addrLen = listenAddrLen
 	}
-	ln.mu.Lock()
-	ln.m[fd] = string(data[:addrLen])
-	ln.mu.Unlock()
-
-	*connOut = fd
-
-	return 0
+	return fd, string(data[:addrLen]), nil
 }
 
 func newConn(s *server, netConn net.Conn, connOut *C.int) error {
