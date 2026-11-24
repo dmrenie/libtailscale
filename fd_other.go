@@ -28,11 +28,8 @@ func socketpair() ([2]int, error) {
 	return fds, nil
 }
 
-// recvFlags are the flags TsnetAccept passes to Recvmsg: MSG_WAITALL
-// to keep listener socketpair record framing exact. Platforms without
-// MSG_CMSG_CLOEXEC mark the fd received via SCM_RIGHTS close-on-exec
-// with closeOnExec instead.
-const recvFlags = syscall.MSG_WAITALL
+// closeOnExec marks the received descriptor on systems without MSG_CMSG_CLOEXEC.
+const recvFlags = 0
 
 // closeOnExec marks fd close-on-exec. It runs right after Recvmsg
 // installed fd, closing the window in which a concurrent fork could
